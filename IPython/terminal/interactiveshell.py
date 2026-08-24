@@ -43,10 +43,11 @@ from prompt_toolkit.layout.processors import ConditionalProcessor, HighlightMatc
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import PromptSession, CompleteStyle, print_formatted_text
-from prompt_toolkit.styles import BaseStyle, DynamicStyle, merge_styles
+from prompt_toolkit.styles import BaseStyle, DynamicStyle, merge_styles, Style as PTKStyle
 from prompt_toolkit.styles.pygments import style_from_pygments_dict
 from pygments.style import Style
 
+from .docstring import DocstringPopupManager
 from .magics import TerminalMagics
 from .pt_inputhooks import get_inputhook_name_and_func
 from .prompts import Prompts, ClassicPrompts, RichPromptDisplayHook
@@ -454,6 +455,21 @@ class TerminalInteractiveShell(InteractiveShell):
         help="Allows to enable/disable the prompt toolkit history search"
     ).tag(config=True)
 
+    docstring_popup = Bool(
+        True,
+        help="Display function signature and docstring popup after opening parentheses.",
+    ).tag(config=True)
+
+    docstring_popup_delay = Float(
+        0.2,
+        help="Delay in seconds before displaying docstring popup.",
+    ).tag(config=True)
+
+    docstring_popup_max_lines = Integer(
+        12,
+        help="Maximum number of docstring lines to display in popup.",
+    ).tag(config=True)
+
     autosuggestions_provider = Unicode(
         "NavigableAutoSuggestFromHistory",
         help="Specifies from which source automatic suggestions are provided. "
@@ -853,6 +869,9 @@ class TerminalInteractiveShell(InteractiveShell):
         if isinstance(self.auto_suggest, NavigableAutoSuggestFromHistory):
             self.auto_suggest.connect(self.pt_app)
 
+        self.docstring_popup_manager = DocstringPopupManager(shell=self)
+        self.docstring_popup_manager.attach_to_session(self.pt_app)
+
     def _make_style_from_name_or_cls(self, name_or_cls):
         """
         Small wrapper that make an IPython compatible style from a style name
@@ -868,17 +887,32 @@ class TerminalInteractiveShell(InteractiveShell):
         if legacy == "nocolor":
             style_overrides = {}
             base_styles = _NoStyle.styles
+            docstring_popup_style = {
+                "docstring-popup.active-param": "underline bold",
+            }
         else:
             style_overrides = {**theme.extra_style, **self.highlighting_style_overrides}
             if theme.base is not None:
                 base_styles = _pygments_base_styles(theme.base)
             else:
                 base_styles = _NoStyle.styles
+            docstring_popup_style = {
+                "docstring-popup": "bg:#2b2b2b #f8f8f2",
+                "docstring-popup.frame": "#6272a4",
+                "docstring-popup.name": "bold #50fa7b",
+                "docstring-popup.active-param": "bold underline #ffb86c",
+                "docstring-popup.param": "#f8f8f2",
+                "docstring-popup.punctuation": "#f8f8f2",
+                "docstring-popup.return": "#8be9fd",
+                "docstring-popup.doc": "#f8f8f2",
+                "docstring-popup.signature": "bold #50fa7b",
+            }
 
         style = merge_styles(
             [
                 style_from_pygments_dict(base_styles),
                 style_from_pygments_dict(style_overrides),
+                PTKStyle.from_dict(docstring_popup_style),
             ]
         )
 
@@ -970,23 +1004,30 @@ class TerminalInteractiveShell(InteractiveShell):
         # If we don't do this, people could spawn coroutine with a
         # while/true inside which will freeze the prompt.
 
+        if hasattr(self, "docstring_popup_manager"):
+            self.docstring_popup_manager.clear()
+
         with patch_stdout(raw=True):
-            if self._use_asyncio_inputhook:
-                # When we integrate the asyncio event loop, run the UI in the
-                # same event loop as the rest of the code. don't use an actual
-                # input hook. (Asyncio is not made for nesting event loops.)
-                asyncio_loop = get_asyncio_loop()
-                text = asyncio_loop.run_until_complete(
-                    self.pt_app.prompt_async(
-                        default=default, **self._extra_prompt_options()
+            try:
+                if self._use_asyncio_inputhook:
+                    # When we integrate the asyncio event loop, run the UI in the
+                    # same event loop as the rest of the code. don't use an actual
+                    # input hook. (Asyncio is not made for nesting event loops.)
+                    asyncio_loop = get_asyncio_loop()
+                    text = asyncio_loop.run_until_complete(
+                        self.pt_app.prompt_async(
+                            default=default, **self._extra_prompt_options()
+                        )
                     )
-                )
-            else:
-                text = self.pt_app.prompt(
-                    default=default,
-                    inputhook=self._inputhook,
-                    **self._extra_prompt_options(),
-                )
+                else:
+                    text = self.pt_app.prompt(
+                        default=default,
+                        inputhook=self._inputhook,
+                        **self._extra_prompt_options(),
+                    )
+            finally:
+                if hasattr(self, "docstring_popup_manager"):
+                    self.docstring_popup_manager.clear()
 
         return text
 
