@@ -17,9 +17,12 @@ from prompt_toolkit.layout.containers import (
     ConditionalContainer,
     Float,
     FloatContainer,
+    HSplit,
+    VSplit,
     Window,
 )
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.widgets import Frame
 
 if TYPE_CHECKING:
@@ -259,6 +262,7 @@ class DocstringPopupManager:
         self._current_formatted_text: FormattedText | None = None
         self._last_evaluated: tuple[str, int] | None = None
         self._pending_timer: Any | None = None
+        self._popup_top_container: Any | None = None
         self._popup_float: Float | None = None
 
     def get_formatted_text(self) -> FormattedText:
@@ -394,8 +398,91 @@ class DocstringPopupManager:
             except Exception:
                 pass
 
+    def should_render_above(self) -> bool:
+        """Return True if there is not enough vertical space below the cursor in the terminal."""
+        if self.session is None or not hasattr(self.session, "app"):
+            return False
+        app = self.session.app
+        if app is None or not hasattr(app, "renderer") or not hasattr(app, "output"):
+            return False
+
+        try:
+            renderer = app.renderer
+            min_avail = getattr(renderer, "_min_available_height", 0)
+            if min_avail > 0:
+                needed_height = 6
+                if self._current_formatted_text:
+                    text = "".join(t[1] for t in self._current_formatted_text)
+                    needed_height = text.count("\n") + 3
+                return min_avail < (needed_height + 1)
+        except Exception:
+            pass
+        return False
+
+    def get_cursor_x_offset(self) -> Dimension:
+        """Calculate the horizontal offset to align the popup with the cursor."""
+        if self.session is None or not hasattr(self.session, "app"):
+            return Dimension.exact(0)
+        app = self.session.app
+        if app is None:
+            return Dimension.exact(0)
+
+        try:
+            # 1. Retrieve cursor X coordinate from the last rendered screen
+            renderer = getattr(app, "renderer", None)
+            last_screen = getattr(renderer, "_last_screen", None)
+            if last_screen is not None:
+                win = self.session.layout.current_window
+                cpos = last_screen.get_cursor_position(win)
+                x = cpos.x
+            else:
+                buf = self.session.default_buffer
+                x = 8 + buf.document.cursor_position_col
+
+            # Ensure popup does not overflow the right edge of the terminal
+            output = getattr(app, "output", None)
+            if output is not None:
+                cols = output.get_size().columns
+                content_width = 60
+                if self._current_formatted_text:
+                    lines = "".join(t[1] for t in self._current_formatted_text).split("\n")
+                    content_width = max(len(l) for l in lines) + 4
+                max_x = max(0, cols - content_width)
+                x = min(x, max_x)
+
+            return Dimension.exact(max(0, x))
+        except Exception:
+            return Dimension.exact(0)
+
+    def create_top_container(self) -> Any:
+        """Create the container widget placed directly above the prompt when space below is insufficient."""
+        content_window = Window(
+            content=FormattedTextControl(self.get_formatted_text),
+            wrap_lines=False,
+            dont_extend_width=True,
+            dont_extend_height=True,
+            style="class:docstring-popup",
+        )
+
+        frame = Frame(content_window, style="class:docstring-popup.frame")
+        left_spacer = Window(width=self.get_cursor_x_offset, dont_extend_width=True)
+        compact_box = VSplit([left_spacer, frame, Window()])
+
+        visible_filter = (
+            Condition(self.is_visible)
+            & Condition(self.should_render_above)
+            & has_focus(DEFAULT_BUFFER)
+            & ~is_done
+            & ~has_completions
+        )
+
+        return ConditionalContainer(
+            content=compact_box,
+            filter=visible_filter,
+        )
+
     def create_float(self) -> Float:
-        """Create the Float widget for the docstring popup."""
+        """Create the floating popup widget displayed below the cursor when space allows."""
         content_window = Window(
             content=FormattedTextControl(self.get_formatted_text),
             wrap_lines=False,
@@ -408,6 +495,7 @@ class DocstringPopupManager:
 
         visible_filter = (
             Condition(self.is_visible)
+            & ~Condition(self.should_render_above)
             & has_focus(DEFAULT_BUFFER)
             & ~is_done
             & ~has_completions
@@ -424,17 +512,29 @@ class DocstringPopupManager:
         )
 
     def attach_to_session(self, session: PromptSession) -> None:
-        """Attach event handlers and layout float to PromptSession."""
+        """Attach event handlers and layout widgets to PromptSession."""
         self.session = session
         buf = session.default_buffer
 
         buf.on_text_changed += self.on_buffer_changed
         buf.on_cursor_position_changed += self.on_buffer_changed
 
+        if self._popup_top_container is None:
+            self._popup_top_container = self.create_top_container()
         if self._popup_float is None:
             self._popup_float = self.create_float()
 
-        # Find FloatContainers in the layout hierarchy and add the popup float
+        # Place the top container directly above the prompt in the session layout HSplit
+        if isinstance(session.layout.container, HSplit):
+            if self._popup_top_container not in session.layout.container.children:
+                session.layout.container.children.insert(0, self._popup_top_container)
+        else:
+            session.layout.container = HSplit([
+                self._popup_top_container,
+                session.layout.container,
+            ])
+
+        # Attach the popup float to inner FloatContainers in the session layout
         self._inject_float(session.layout.container)
 
     def _inject_float(self, container: Any) -> None:

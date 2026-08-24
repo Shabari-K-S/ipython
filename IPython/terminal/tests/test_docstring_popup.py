@@ -208,6 +208,7 @@ async def test_popup_manager_attach_to_session():
 
     manager.attach_to_session(session)
     assert manager.session is session
+    assert manager._popup_top_container is not None
     assert manager._popup_float is not None
 
     # Test session buffer clearing
